@@ -24,6 +24,9 @@
 // Revisions are now tracked on GitHub
 // https://github.com/PaulStoffregen/AltSoftSerial
 //
+// This version: hpyle hacked support for ASR33 with two stop bits
+// and inverted tx and rx
+//
 // Version 1.2: Support Teensy 3.x
 //
 // Version 1.1: Improve performance in receiver code
@@ -34,6 +37,17 @@
 #include "AltSoftSerial.h"
 #include "config/AltSoftSerial_Boards.h"
 #include "config/AltSoftSerial_Timers.h"
+
+#define RX_INVERTED
+
+#ifdef RX_INVERTED
+#define CAPTURE_RISING_EDGE  CONFIG_CAPTURE_FALLING_EDGE
+#define CAPTURE_FALLING_EDGE CONFIG_CAPTURE_RISING_EDGE
+#else
+#define CAPTURE_RISING_EDGE  CONFIG_CAPTURE_RISING_EDGE
+#define CAPTURE_FALLING_EDGE CONFIG_CAPTURE_FALLING_EDGE
+#endif
+
 
 /****************************************/
 /**          Initialization            **/
@@ -55,11 +69,14 @@ static volatile uint8_t rx_buffer[RX_BUFFER_SIZE];
 static volatile uint8_t tx_state=0;
 static uint8_t tx_byte;
 static uint8_t tx_bit;
+static uint16_t tx_stop_ticks=0;
 static volatile uint8_t tx_buffer_head;
 static volatile uint8_t tx_buffer_tail;
 #define TX_BUFFER_SIZE 68
 static volatile uint8_t tx_buffer[TX_BUFFER_SIZE];
 
+static bool tx_break = false;
+static bool AltSoftSerial_invert = false;
 
 #ifndef INPUT_PULLUP
 #define INPUT_PULLUP INPUT
@@ -67,20 +84,30 @@ static volatile uint8_t tx_buffer[TX_BUFFER_SIZE];
 
 #define MAX_COUNTS_PER_BIT  6241  // 65536 / 10.5
 
+AltSoftSerial::AltSoftSerial(bool tx_invert)
+{
+	AltSoftSerial_invert = tx_invert;
+}
+
+AltSoftSerial::AltSoftSerial(uint8_t rxPin, uint8_t txPin, bool inverse /*= false*/)
+{
+	AltSoftSerial_invert = inverse;
+}
+
 void AltSoftSerial::init(uint32_t cycles_per_bit)
 {
-	//Serial.printf("cycles_per_bit = %d\n", cycles_per_bit);
+	// Serial.printf("cycles_per_bit = %d\n", cycles_per_bit);
 	if (cycles_per_bit < MAX_COUNTS_PER_BIT) {
 		CONFIG_TIMER_NOPRESCALE();
 	} else {
 		cycles_per_bit /= 8;
-		//Serial.printf("cycles_per_bit/8 = %d\n", cycles_per_bit);
+		// Serial.printf("cycles_per_bit/8 = %d\n", cycles_per_bit);
 		if (cycles_per_bit < MAX_COUNTS_PER_BIT) {
 			CONFIG_TIMER_PRESCALE_8();
 		} else {
 #if defined(CONFIG_TIMER_PRESCALE_256)
 			cycles_per_bit /= 32;
-			//Serial.printf("cycles_per_bit/256 = %d\n", cycles_per_bit);
+			// Serial.printf("cycles_per_bit/256 = %d\n", cycles_per_bit);
 			if (cycles_per_bit < MAX_COUNTS_PER_BIT) {
 				CONFIG_TIMER_PRESCALE_256();
 			} else {
@@ -100,10 +127,16 @@ void AltSoftSerial::init(uint32_t cycles_per_bit)
 		}
 	}
 	ticks_per_bit = cycles_per_bit;
-	rx_stop_ticks = cycles_per_bit * 37 / 4;
+	rx_stop_ticks = cycles_per_bit * 41 / 4; // was 37/4 for 9.25 bits
+	tx_stop_ticks = cycles_per_bit * 2;
 	pinMode(INPUT_CAPTURE_PIN, INPUT_PULLUP);
-	digitalWrite(OUTPUT_COMPARE_A_PIN, HIGH);
+	//digitalWrite(OUTPUT_COMPARE_A_PIN, HIGH);
 	pinMode(OUTPUT_COMPARE_A_PIN, OUTPUT);
+	setBreak();
+//	if (AltSoftSerial_invert)
+//		digitalWrite(OUTPUT_COMPARE_A_PIN, LOW);
+//	else
+//		digitalWrite(OUTPUT_COMPARE_A_PIN, HIGH);
 	rx_state = 0;
 	rx_buffer_head = 0;
 	rx_buffer_tail = 0;
@@ -145,7 +178,11 @@ void AltSoftSerial::writeByte(uint8_t b)
 		tx_byte = b;
 		tx_bit = 0;
 		ENABLE_INT_COMPARE_A();
-		CONFIG_MATCH_CLEAR();
+		// CONFIG_MATCH_CLEAR();
+		if (AltSoftSerial_invert)
+			CONFIG_MATCH_SET();
+		else
+			CONFIG_MATCH_CLEAR();
 		SET_COMPARE_A(GET_TIMER_COUNT() + 16);
 	}
 	SREG = intr_state;
@@ -170,9 +207,17 @@ ISR(COMPARE_A_INTERRUPT)
 		state++;
 		if (bit != tx_bit) {
 			if (bit) {
-				CONFIG_MATCH_SET();
+			        // CONFIG_MATCH_SET();
+				if (AltSoftSerial_invert)
+					CONFIG_MATCH_CLEAR();
+				else
+					CONFIG_MATCH_SET();
 			} else {
-				CONFIG_MATCH_CLEAR();
+				// CONFIG_MATCH_CLEAR();
+				if (AltSoftSerial_invert)
+					CONFIG_MATCH_SET();
+				else
+					CONFIG_MATCH_CLEAR();
 			}
 			SET_COMPARE_A(target);
 			tx_bit = bit;
@@ -188,11 +233,11 @@ ISR(COMPARE_A_INTERRUPT)
 		if (state == 10) {
 			// Wait for final stop bit to finish
 			tx_state = 11;
-			SET_COMPARE_A(target + ticks_per_bit);
+			SET_COMPARE_A(target + tx_stop_ticks);
 		} else {
-			tx_state = 0;
 			CONFIG_MATCH_NORMAL();
 			DISABLE_INT_COMPARE_A();
+			tx_state = 0;
 		}
 	} else {
 		if (++tail >= TX_BUFFER_SIZE) tail = 0;
@@ -200,8 +245,12 @@ ISR(COMPARE_A_INTERRUPT)
 		tx_byte = tx_buffer[tail];
 		tx_bit = 0;
 		CONFIG_MATCH_CLEAR();
+		if (AltSoftSerial_invert)
+			CONFIG_MATCH_SET();
+		else
+			CONFIG_MATCH_CLEAR();
 		if (state == 10)
-			SET_COMPARE_A(target + ticks_per_bit);
+			SET_COMPARE_A(target + tx_stop_ticks);
 		else
 			SET_COMPARE_A(GET_TIMER_COUNT() + 16);
 		tx_state = 1;
@@ -212,6 +261,20 @@ ISR(COMPARE_A_INTERRUPT)
 void AltSoftSerial::flushOutput(void)
 {
 	while (tx_state) /* wait */ ;
+}
+
+bool AltSoftSerial::isWriting(void)
+{
+	return (tx_state != 0) || (tx_buffer_head != tx_buffer_tail);
+}
+
+void AltSoftSerial::setBreak(void)
+{
+	flushOutput();
+	if (AltSoftSerial_invert)
+		digitalWrite(OUTPUT_COMPARE_A_PIN, LOW);
+	else
+		digitalWrite(OUTPUT_COMPARE_A_PIN, HIGH);
 }
 
 
@@ -228,15 +291,16 @@ ISR(CAPTURE_INTERRUPT)
 	capture = GET_INPUT_CAPTURE();
 	bit = rx_bit;
 	if (bit) {
-		CONFIG_CAPTURE_FALLING_EDGE();
+		CAPTURE_FALLING_EDGE();
 		rx_bit = 0;
 	} else {
-		CONFIG_CAPTURE_RISING_EDGE();
+		CAPTURE_RISING_EDGE();
 		rx_bit = 0x80;
 	}
 	state = rx_state;
 	if (state == 0) {
 		if (!bit) {
+			// found a start bit
 			uint16_t end = capture + rx_stop_ticks;
 			SET_COMPARE_B(end);
 			ENABLE_INT_COMPARE_B();
@@ -260,7 +324,7 @@ ISR(CAPTURE_INTERRUPT)
 					rx_buffer[head] = rx_byte;
 					rx_buffer_head = head;
 				}
-				CONFIG_CAPTURE_FALLING_EDGE();
+				CAPTURE_FALLING_EDGE();
 				rx_bit = 0;
 				rx_state = 0;
 				return;
@@ -277,7 +341,7 @@ ISR(COMPARE_B_INTERRUPT)
 	uint8_t head, state, bit;
 
 	DISABLE_INT_COMPARE_B();
-	CONFIG_CAPTURE_FALLING_EDGE();
+	CAPTURE_FALLING_EDGE();
 	state = rx_state;
 	bit = rx_bit ^ 0x80;
 	while (state < 9) {
@@ -291,7 +355,7 @@ ISR(COMPARE_B_INTERRUPT)
 		rx_buffer_head = head;
 	}
 	rx_state = 0;
-	CONFIG_CAPTURE_FALLING_EDGE();
+	CAPTURE_FALLING_EDGE();
 	rx_bit = 0;
 }
 
@@ -334,6 +398,11 @@ int AltSoftSerial::available(void)
 void AltSoftSerial::flushInput(void)
 {
 	rx_buffer_head = rx_buffer_tail;
+}
+
+bool AltSoftSerial::isReading(void)
+{
+	return (rx_state != 0) || (rx_buffer_head != rx_buffer_tail);
 }
 
 
