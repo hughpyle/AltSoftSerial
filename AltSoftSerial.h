@@ -63,7 +63,9 @@ public:
 	static void flushOutput();
 	static bool isWriting();
 	static bool isReading();
-	// Set "break condition" on the line (open-loop)
+	// Detect a "break condition" (open-loop) on the Rx line
+	static bool isBreak();
+	// Set a "break condition" (open-loop) on the Tx line
 	static void setBreak();
 	// for drop-in compatibility with NewSoftSerial, rxPin & txPin ignored
 	AltSoftSerial(uint8_t rxPin, uint8_t txPin, bool inverse = false);

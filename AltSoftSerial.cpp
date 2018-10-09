@@ -54,8 +54,10 @@
 /****************************************/
 
 static uint16_t ticks_per_bit=0;
+static uint16_t rx_err_ticks=0;
 bool AltSoftSerial::timing_error=false;
 
+#define STATE_BREAK 0xFF
 static uint8_t rx_state;
 static uint8_t rx_byte;
 static uint8_t rx_bit = 0;
@@ -115,7 +117,7 @@ void AltSoftSerial::init(uint32_t cycles_per_bit)
 			}
 #elif defined(CONFIG_TIMER_PRESCALE_128)
 			cycles_per_bit /= 16;
-			//Serial.printf("cycles_per_bit/128 = %d\n", cycles_per_bit);
+			// Serial.printf("cycles_per_bit/128 = %d\n", cycles_per_bit);
 			if (cycles_per_bit < MAX_COUNTS_PER_BIT) {
 				CONFIG_TIMER_PRESCALE_128();
 			} else {
@@ -127,8 +129,9 @@ void AltSoftSerial::init(uint32_t cycles_per_bit)
 		}
 	}
 	ticks_per_bit = cycles_per_bit;
-	rx_stop_ticks = cycles_per_bit * 41 / 4; // was 37/4 for 9.25 bits
+	rx_stop_ticks = cycles_per_bit * 41 / 4; // was 37/4 for 9.25 bits; now 10.25
 	tx_stop_ticks = cycles_per_bit * 2;
+	rx_err_ticks  = cycles_per_bit * 3;      // 3 additional bits will identify a break
 	pinMode(INPUT_CAPTURE_PIN, INPUT_PULLUP);
 	//digitalWrite(OUTPUT_COMPARE_A_PIN, HIGH);
 	pinMode(OUTPUT_COMPARE_A_PIN, OUTPUT);
@@ -298,9 +301,19 @@ ISR(CAPTURE_INTERRUPT)
 		rx_bit = 0x80;
 	}
 	state = rx_state;
-	if (state == 0) {
+	if (state == STATE_BREAK) {
+		// Transitioned out of break.  Next, wait for a start bit.
+		AltSoftSerial::timing_error = false;
+		DISABLE_INT_COMPARE_B();
+		rx_state = 0;
+		CAPTURE_FALLING_EDGE();
+		rx_bit = 0;
+	} else if (state == 0) {
+		AltSoftSerial::timing_error = false;
+		DISABLE_INT_COMPARE_B();
 		if (!bit) {
-			// found a start bit
+			// Found a start bit.
+			// Set a timer interrupt when we expect to see the stopbits
 			uint16_t end = capture + rx_stop_ticks;
 			SET_COMPARE_B(end);
 			ENABLE_INT_COMPARE_B();
@@ -312,11 +325,12 @@ ISR(CAPTURE_INTERRUPT)
 		offset_overflow = 65535 - ticks_per_bit;
 		while (1) {
 			offset = capture - target;
-			if (offset > offset_overflow) break;
+			if (offset > offset_overflow) break; // done with these bits, want more
 			rx_byte = (rx_byte >> 1) | rx_bit;
 			target += ticks_per_bit;
 			state++;
 			if (state >= 9) {
+				// Got this word
 				DISABLE_INT_COMPARE_B();
 				head = rx_buffer_head + 1;
 				if (head >= RX_BUFFER_SIZE) head = 0;
@@ -324,6 +338,15 @@ ISR(CAPTURE_INTERRUPT)
 					rx_buffer[head] = rx_byte;
 					rx_buffer_head = head;
 				}
+				if(!bit) {
+					// We are low or break.
+					// Set a timer in case we never see the transition to a stop bit.
+					rx_target = target;
+					uint16_t end = target + rx_err_ticks;
+					SET_COMPARE_B(end);
+					ENABLE_INT_COMPARE_B();
+				}
+				// Set up to capture the start-bit of the next word
 				CAPTURE_FALLING_EDGE();
 				rx_bit = 0;
 				rx_state = 0;
@@ -333,30 +356,45 @@ ISR(CAPTURE_INTERRUPT)
 		rx_target = target;
 		rx_state = state;
 	}
-	//if (GET_TIMER_COUNT() - capture > ticks_per_bit) AltSoftSerial::timing_error = true;
+	// Detect timing error
+// AltSoftSerial::timing_error = (GET_TIMER_COUNT() - capture > rx_err_ticks);
 }
 
 ISR(COMPARE_B_INTERRUPT)
 {
 	uint8_t head, state, bit;
+	uint16_t offset;
+	uint16_t offset_overflow = 65535 - ticks_per_bit;
 
 	DISABLE_INT_COMPARE_B();
 	CAPTURE_FALLING_EDGE();
-	state = rx_state;
-	bit = rx_bit ^ 0x80;
-	while (state < 9) {
-		rx_byte = (rx_byte >> 1) | bit;
-		state++;
+
+	// Are we still waiting for stop-bits?  If so we're in a break.
+	offset = GET_INPUT_CAPTURE() - rx_target;
+	bool err = (offset >= rx_err_ticks) && !(offset > offset_overflow);
+	AltSoftSerial::timing_error = err;
+	if(err) {
+		// We're at a break.  Before we see a start-bit we need a stop-bit.
+		rx_state = STATE_BREAK;
+		CAPTURE_RISING_EDGE();
+	} else {
+		state = rx_state;
+		bit = rx_bit ^ 0x80;
+		while (state < 9) {
+			rx_byte = (rx_byte >> 1) | bit;
+			state++;
+		}
+		head = rx_buffer_head + 1;
+		if (head >= RX_BUFFER_SIZE) head = 0;
+		if (head != rx_buffer_tail) {
+			rx_buffer[head] = rx_byte;
+			rx_buffer_head = head;
+		}
+		// Look for the next start-bit
+		rx_state = 0;
+		CAPTURE_FALLING_EDGE();
+		rx_bit = 0;
 	}
-	head = rx_buffer_head + 1;
-	if (head >= RX_BUFFER_SIZE) head = 0;
-	if (head != rx_buffer_tail) {
-		rx_buffer[head] = rx_byte;
-		rx_buffer_head = head;
-	}
-	rx_state = 0;
-	CAPTURE_FALLING_EDGE();
-	rx_bit = 0;
 }
 
 
@@ -403,6 +441,15 @@ void AltSoftSerial::flushInput(void)
 bool AltSoftSerial::isReading(void)
 {
 	return (rx_state != 0) || (rx_buffer_head != rx_buffer_tail);
+}
+
+bool AltSoftSerial::isBreak(void)
+{
+	// isAvailable just tells us whether there are characters waiting to be consumed.
+	// isBreak sets when the line is in a "break condition" (stop-bit condition) for
+	// more than a character.  This is typically caused by a break in the current loop,
+	// or by a line fault, and can be signaled directly by the teletype's BREAK key.
+	return (rx_state == STATE_BREAK);
 }
 
 
